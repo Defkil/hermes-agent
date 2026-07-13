@@ -109,6 +109,36 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _dispatcher_tick_is_stuck_candidate(results, *, ready_boards: set[str]) -> bool:
+    """Return whether a zero-spawn tick is unexpectedly stalled.
+
+    Capacity limits, the singleton lock, respawn guards, and provider
+    cooldowns are deliberate deferrals. They leave work in ``ready`` while
+    another worker or a later tick is expected to make progress, so treating
+    them as a broken PATH/profile/credential loop produces false alarms.
+    """
+    if not ready_boards:
+        return False
+
+    results_by_board = dict(results or [])
+    for slug in ready_boards:
+        res = results_by_board.get(slug)
+        if res is None:
+            return True
+        if getattr(res, "spawned", None):
+            continue
+        expected_deferral = (
+            bool(getattr(res, "skipped_locked", False))
+            or bool(getattr(res, "skipped_global_capped", False))
+            or bool(getattr(res, "skipped_per_profile_capped", None))
+            or bool(getattr(res, "respawn_guarded", None))
+            or bool(getattr(res, "rate_limited", None))
+        )
+        if not expected_deferral:
+            return True
+    return False
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1077,31 +1107,28 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _spawnable_ready_boards() -> set[str]:
+            """Return boards with ready work owned by real Hermes profiles.
 
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            Tasks assigned to control-plane lanes (e.g. ``orion-cc`` or
+            ``orion-research``) are pulled directly by terminals. A queue of
+            those tasks is correctly idle and must not trigger a stuck alert.
             """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            ready_boards: set[str] = set()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
+                    if (
+                        _kb.has_spawnable_ready(conn)
+                        or _kb.has_spawnable_review(conn)
+                    ):
+                        ready_boards.add(slug)
                 except Exception:
                     continue
                 finally:
@@ -1110,7 +1137,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return ready_boards
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1233,10 +1260,8 @@ class GatewayKanbanWatchersMixin:
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
-                any_spawned = False
                 for slug, res in (results or []):
                     if res is not None and getattr(res, "spawned", None):
-                        any_spawned = True
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
@@ -1251,8 +1276,11 @@ class GatewayKanbanWatchersMixin:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                ready_boards = await asyncio.to_thread(_spawnable_ready_boards)
+                if _dispatcher_tick_is_stuck_candidate(
+                    results,
+                    ready_boards=ready_boards,
+                ):
                     bad_ticks += 1
                 else:
                     bad_ticks = 0

@@ -5942,6 +5942,11 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_global_capped: bool = False
+    """True when ``max_in_progress`` leaves no global worker capacity.
+
+    This is an expected deferral, not a dispatcher health failure: ready work
+    should remain queued until one of the current workers finishes."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7470,7 +7475,7 @@ def _dispatch_once_locked(
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
-    if max_spawn is not None:
+    if max_spawn is not None or max_in_progress is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -7486,16 +7491,17 @@ def _dispatch_once_locked(
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
+    if max_in_progress is not None:
+        if running_count >= max_in_progress:
+            result.skipped_global_capped = True
             return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+        # The loop below compares ``running_count + spawned`` against an
+        # absolute concurrency ceiling. Keep both limits in that same unit:
+        # converting max_in_progress to a remaining-slot count here made two
+        # running workers and a cap of three compare as ``2 >= 1``, leaving the
+        # final slot permanently unused whenever both settings were enabled.
+        if max_spawn is None or max_spawn > max_in_progress:
+            max_spawn = max_in_progress
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn

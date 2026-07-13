@@ -8,8 +8,12 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _dispatcher_tick_is_stuck_candidate,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -43,6 +47,64 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+def _dispatch_result(**overrides):
+    values = {
+        "spawned": [],
+        "skipped_locked": False,
+        "skipped_global_capped": False,
+        "skipped_per_profile_capped": [],
+        "respawn_guarded": [],
+        "rate_limited": [],
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_dispatcher_health_does_not_flag_expected_capacity_deferral():
+    results = [("d3v3l", _dispatch_result(
+        skipped_per_profile_capped=[("t_ready", "reviewer", 2)],
+    ))]
+
+    assert not _dispatcher_tick_is_stuck_candidate(results, ready_boards={"d3v3l"})
+
+
+def test_dispatcher_health_does_not_flag_global_capacity_deferral():
+    results = [("d3v3l", _dispatch_result(skipped_global_capped=True))]
+
+    assert not _dispatcher_tick_is_stuck_candidate(results, ready_boards={"d3v3l"})
+
+
+def test_dispatcher_health_still_flags_unexplained_zero_spawn():
+    results = [("d3v3l", _dispatch_result())]
+
+    assert _dispatcher_tick_is_stuck_candidate(results, ready_boards={"d3v3l"})
+
+
+def test_dispatcher_health_ignores_lock_and_respawn_deferrals():
+    assert not _dispatcher_tick_is_stuck_candidate(
+        [("d3v3l", _dispatch_result(skipped_locked=True))],
+        ready_boards={"d3v3l"},
+    )
+    assert not _dispatcher_tick_is_stuck_candidate(
+        [("d3v3l", _dispatch_result(respawn_guarded=[("t_ready", "recent_success")]))],
+        ready_boards={"d3v3l"},
+    )
+
+
+def test_dispatcher_health_keeps_board_deferrals_isolated():
+    results = [
+        ("busy", _dispatch_result(
+            skipped_per_profile_capped=[("t_busy", "reviewer", 2)],
+        )),
+        ("broken", _dispatch_result()),
+    ]
+
+    assert _dispatcher_tick_is_stuck_candidate(
+        results,
+        ready_boards={"busy", "broken"},
+    )
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

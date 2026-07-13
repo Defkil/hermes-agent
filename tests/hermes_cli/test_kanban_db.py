@@ -876,6 +876,7 @@ def _exited_status(code: int) -> int:
     return code << 8
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX wait-status classification")
 def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     import hermes_cli.kanban_db as _kb
 
@@ -890,6 +891,7 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX wait-status classification")
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):
@@ -1793,6 +1795,36 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert kb.get_task(conn, ready_b).status == "ready"
 
 
+def test_dispatch_combined_caps_fill_remaining_capacity(
+    kanban_home, all_assignees_spawnable
+):
+    """Combined absolute caps must still fill the remaining worker slot."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running_a = kb.create_task(conn, title="running-a", assignee="alice")
+        running_b = kb.create_task(conn, title="running-b", assignee="bob")
+        ready_a = kb.create_task(conn, title="ready-a", assignee="carol")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="dave")
+        kb.claim_task(conn, running_a)
+        kb.claim_task(conn, running_b)
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=3,
+            max_in_progress=3,
+        )
+
+        assert len(res.spawned) == 1
+        assert spawns == [ready_a]
+        assert kb.get_task(conn, ready_a).status == "running"
+        assert kb.get_task(conn, ready_b).status == "ready"
+
+
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="alice")
@@ -2159,7 +2191,7 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{t}" in listed
 
 
@@ -2243,7 +2275,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -2282,7 +2314,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
@@ -2341,8 +2373,8 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         capture_output=True,
         text=True,
     ).stdout
-    assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert listed.count(f"worktree {expected.as_posix()}\n") == 1
+    assert f"worktree {expected.as_posix()}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
 
 
@@ -3449,6 +3481,7 @@ def test_resolve_hermes_argv_prefers_path_shim(monkeypatch):
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/hermes")
     argv = kb._resolve_hermes_argv()
     assert argv == ["/usr/local/bin/hermes"]
@@ -3510,6 +3543,7 @@ def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_pat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", str(path_hermes.parent))
     monkeypatch.setenv("HERMES_BIN", "hermes")
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
 
     assert kb._resolve_hermes_argv() == [str(path_hermes)]
 
@@ -3568,6 +3602,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
@@ -3816,8 +3851,9 @@ def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees
         # Two more ready to spawn — but cap is 2 so none should fire.
         kb.create_task(conn, title="c", assignee="bob")
         kb.create_task(conn, title="d", assignee="alice")
-        kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=2)
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=2)
 
+    assert result.skipped_global_capped is True
     assert len(spawns) == 0, f"expected 0 spawns, got {len(spawns)}"
 
 
@@ -3854,6 +3890,33 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=None)
 
     assert len(spawns) == 4, f"expected 4 spawns (unlimited), got {len(spawns)}"
+
+
+def test_dispatch_max_in_progress_also_caps_review_only_queue(
+    kanban_home, all_assignees_spawnable
+):
+    """Review workers share the same global concurrency cap as ready work."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        review = kb.create_task(conn, title="review", assignee="reviewer")
+        kb.claim_task(conn, running)
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_in_progress=1,
+        )
+
+    assert result.skipped_global_capped is True
+    assert spawns == []
+
 
 # Review column dispatch
 # ---------------------------------------------------------------------------
@@ -4749,6 +4812,7 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid reaper")
 def test_reap_worker_zombies_returns_count():
     """reap_worker_zombies() returns the list of reaped PIDs."""
     from unittest.mock import patch
@@ -4789,6 +4853,7 @@ def test_reap_worker_zombies_noop_no_children():
     assert result == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid reaper")
 def test_reap_worker_zombies_records_exit_status():
     """reap_worker_zombies() calls _record_worker_exit for each reaped pid."""
     from unittest.mock import patch
@@ -4821,6 +4886,7 @@ def test_reap_worker_zombies_handles_waitpid_os_error():
     assert result == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid reaper")
 def test_zombie_reaper_runs_despite_board_connect_failure():
     """reap_worker_zombies runs even when a board tick raises an error."""
     from unittest.mock import patch
@@ -4847,6 +4913,7 @@ def test_zombie_reaper_runs_despite_board_connect_failure():
     assert pids == [12345, 67890]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid reaper")
 def test_zombie_reaper_survives_all_boards_failing():
     """reap_worker_zombies runs each tick regardless of board tick failures."""
     from unittest.mock import patch
@@ -4878,6 +4945,7 @@ def test_zombie_reaper_survives_all_boards_failing():
     assert total_reaped == 10
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX waitpid reaper")
 def test_dispatch_once_still_reaps_via_extracted_fn(kanban_home):
     """The reaper inside dispatch_once still works after refactor to reap_worker_zombies()."""
     from unittest.mock import patch

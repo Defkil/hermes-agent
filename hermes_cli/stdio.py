@@ -29,6 +29,7 @@ sort it out.  Python doesn't get that luxury.
 
 from __future__ import annotations
 
+from functools import wraps
 import os
 import sys
 
@@ -64,6 +65,44 @@ def _flip_console_code_page_to_utf8() -> None:
         # ctypes import, missing kernel32, or non-Windows — any failure here
         # is non-fatal.  We've still reconfigured Python's own streams below.
         pass
+
+
+def _configure_subprocess_text_encoding() -> None:
+    """Default implicit Windows subprocess text pipes to UTF-8 safely.
+
+    ``PYTHONUTF8`` only affects Python children; it cannot change the locale
+    selected when this already-running interpreter started. Consequently,
+    ``subprocess.run(..., text=True)`` still builds cp1252 pipe readers and an
+    otherwise valid UTF-8 continuation byte such as ``0x81`` can crash
+    ``subprocess._readerthread``. Wrap ``Popen.__init__`` once so text-mode
+    call sites that did not choose a codec inherit Hermes's UTF-8 contract.
+    Explicit caller choices and binary-mode calls remain untouched.
+    """
+    import subprocess
+
+    original = subprocess.Popen.__init__
+    if getattr(original, "_hermes_utf8_default", False):
+        return
+
+    @wraps(original)
+    def _utf8_popen_init(self, *args, **kwargs):
+        # ``universal_newlines`` predates keyword-only arguments and can still
+        # arrive positionally at index 11. Supplying ``errors`` alone also
+        # enables Popen text mode, even when ``text`` is omitted.
+        positional_universal_newlines = len(args) > 11 and args[11]
+        text_mode = (
+            kwargs.get("text")
+            or kwargs.get("universal_newlines")
+            or positional_universal_newlines
+            or kwargs.get("errors") is not None
+        )
+        if text_mode and kwargs.get("encoding") is None:
+            kwargs["encoding"] = "utf-8"
+            kwargs.setdefault("errors", "replace")
+        return original(self, *args, **kwargs)
+
+    _utf8_popen_init._hermes_utf8_default = True
+    subprocess.Popen.__init__ = _utf8_popen_init
 
 
 def _reconfigure_stream(stream, *, encoding: str = "utf-8", errors: str = "replace") -> None:
@@ -141,6 +180,11 @@ def configure_windows_stdio() -> bool:
     # Flip the console code page first so that any subprocess that
     # inherits the console (e.g. a launched shell) also sees CP_UTF8.
     _flip_console_code_page_to_utf8()
+
+    # ``subprocess.run(..., text=True)`` without an explicit encoding consults
+    # the startup locale, not PYTHONUTF8 destined for child processes. Pin the
+    # implicit pipe codec before any background reader threads are created.
+    _configure_subprocess_text_encoding()
 
     # Reconfigure Python's own stdio wrappers so ``print()`` calls from
     # this process round-trip emoji / box-drawing / non-Latin text.

@@ -50,6 +50,7 @@ class TestConfigureWindowsStdio:
         yield
         sys.modules.pop("hermes_cli.stdio", None)
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only behavior")
     def test_no_op_on_posix(self):
         from hermes_cli import stdio
 
@@ -285,10 +286,11 @@ class TestSigkillFallback:
         result = getattr(fake_signal, "SIGKILL", fake_signal.SIGTERM)
         assert result == 15
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX-only")
     def test_getattr_fallback_prefers_sigkill_when_present(self):
         """On POSIX the fallback is a no-op: real SIGKILL wins."""
         result = getattr(signal, "SIGKILL", signal.SIGTERM)
-        assert result == signal.SIGKILL
+        assert result == signal.SIGKILL  # windows-footgun: ok — POSIX-only test
 
     @pytest.mark.parametrize(
         "module_path, line_pattern",

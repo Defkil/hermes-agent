@@ -132,16 +132,12 @@ def hermes_lsp_bin_dir() -> Path:
 
 def _native_binary_candidates(base: Path) -> list[Path]:
     """Return platform-native executable candidates for a staged binary."""
-    candidates = [base]
     if _is_windows():
-        existing = {str(base).lower()}
-        for suffix in _WINDOWS_WRAPPER_SUFFIXES:
-            candidate = Path(str(base) + suffix)
-            key = str(candidate).lower()
-            if key not in existing:
-                candidates.append(candidate)
-                existing.add(key)
-    return candidates
+        # npm creates both a POSIX shell shim with no extension and native
+        # Windows wrappers. CreateProcess cannot execute the shell shim and
+        # raises WinError 193, so native wrappers must win whenever present.
+        return [Path(str(base) + suffix) for suffix in _WINDOWS_WRAPPER_SUFFIXES] + [base]
+    return [base]
 
 
 def _existing_binary(name: str) -> Optional[str]:
