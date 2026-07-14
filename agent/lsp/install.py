@@ -59,7 +59,11 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
         # (tsserver) to be importable from the same node_modules tree;
         # otherwise initialize() fails with "Could not find a valid
         # TypeScript installation".  Install them together.
-        "extra_pkgs": ["typescript"],
+        # TypeScript 7 no longer ships lib/tsserver.js, while
+        # typescript-language-server 5.x still requires that Node server.
+        # Stay on the newest compatible TypeScript 5 release until the
+        # language server supports the TypeScript 7 server architecture.
+        "extra_pkgs": ["typescript@5"],
     },
     "@vue/language-server": {
         "strategy": "npm",
@@ -135,15 +139,48 @@ def _native_binary_candidates(base: Path) -> list[Path]:
     if _is_windows():
         # npm creates both a POSIX shell shim with no extension and native
         # Windows wrappers. CreateProcess cannot execute the shell shim and
-        # raises WinError 193, so native wrappers must win whenever present.
-        return [Path(str(base) + suffix) for suffix in _WINDOWS_WRAPPER_SUFFIXES] + [base]
+        # raises WinError 193, so never advertise that shim as executable.
+        return [Path(str(base) + suffix) for suffix in _WINDOWS_WRAPPER_SUFFIXES]
     return [base]
+
+
+def _stage_binary(source: Path, destination: Path) -> str:
+    """Expose an installed binary without breaking relative npm wrappers."""
+    if _is_windows() and source.suffix.lower() in {".cmd", ".bat"}:
+        # A previous install may have staged a symlink to the npm wrapper.
+        # Unlink it first: write_text() would otherwise follow the link and
+        # overwrite the source wrapper with a self-recursive forwarder.
+        if destination.is_symlink():
+            destination.unlink()
+        destination.write_text(
+            f'@echo off\r\ncall "{source}" %*\r\n',
+            encoding="utf-8",
+        )
+        return str(destination)
+    if not destination.exists():
+        try:
+            destination.symlink_to(source)
+        except (OSError, NotImplementedError):
+            try:
+                shutil.copy2(source, destination)
+            except OSError:
+                return str(source)
+    return str(destination if destination.exists() else source)
 
 
 def _existing_binary(name: str) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
     for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
         if staged.exists() and os.access(staged, os.X_OK):
+            if _is_windows() and staged.suffix.lower() in {".cmd", ".bat"}:
+                source = (
+                    hermes_lsp_bin_dir().parent
+                    / "node_modules"
+                    / ".bin"
+                    / staged.name
+                )
+                if source.exists():
+                    return _stage_binary(source, staged)
             return str(staged)
     on_path = shutil.which(name)
     if on_path:
@@ -278,18 +315,9 @@ def _install_npm(
     nm_bin = staging / "node_modules" / ".bin" / bin_name
     for c in _native_binary_candidates(nm_bin):
         if c.exists():
-            # Symlink into our `lsp/bin/` for stable PATH access.
+            # Expose the binary through our stable `lsp/bin/` path.
             link = hermes_lsp_bin_dir() / c.name
-            if not link.exists():
-                try:
-                    link.symlink_to(c)
-                except (OSError, NotImplementedError):
-                    # Symlinks fail on some Windows setups — copy instead.
-                    try:
-                        shutil.copy2(c, link)
-                    except OSError:
-                        return str(c)
-            return str(link if link.exists() else c)
+            return _stage_binary(c, link)
     logger.warning("[install] npm install for %s succeeded but bin %s not found", pkg, bin_name)
     return None
 

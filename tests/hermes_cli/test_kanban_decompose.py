@@ -327,6 +327,21 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_auto_decompose_ids_skip_block_loop_escalations(kanban_home):
+    """Human-triage loop breakers must not be consumed by auto-decompose."""
+    with kb.connect() as conn:
+        fresh = kb.create_task(conn, title="fresh request", triage=True)
+        escalated = kb.create_task(conn, title="needs human direction", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, escalated),
+            )
+
+    assert decomp.list_auto_decompose_ids() == [fresh]
+    assert set(decomp.list_triage_ids()) == {fresh, escalated}
+
+
 def test_decompose_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", triage=True)

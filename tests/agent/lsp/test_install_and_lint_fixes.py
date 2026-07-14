@@ -31,9 +31,10 @@ from agent.lsp.install import INSTALL_RECIPES
 def test_typescript_recipe_includes_typescript_sdk():
     recipe = INSTALL_RECIPES["typescript-language-server"]
     extras = recipe.get("extra_pkgs") or []
-    assert "typescript" in extras, (
+    assert "typescript@5" in extras, (
         "typescript-language-server requires the `typescript` SDK as a "
-        "sibling install — without it `initialize` fails with "
+        "compatible sibling install — TypeScript 7 has no tsserver.js and "
+        "without TypeScript 5 `initialize` fails with "
         "'Could not find a valid TypeScript installation'."
     )
 
@@ -56,15 +57,15 @@ def test_install_npm_passes_extras_to_npm_command(tmp_path, monkeypatch):
     monkeypatch.setattr(install_mod.shutil, "which", lambda c: "/usr/bin/npm" if c == "npm" else None)
 
     install_mod._install_npm("typescript-language-server", "typescript-language-server",
-                             extra_pkgs=["typescript"])
+                             extra_pkgs=["typescript@5"])
 
     cmd = captured["cmd"]
     assert "typescript-language-server" in cmd
-    assert "typescript" in cmd
+    assert "typescript@5" in cmd
     # Both must come AFTER the npm flags, in install-target position
     install_idx = cmd.index("install")
     assert cmd.index("typescript-language-server") > install_idx
-    assert cmd.index("typescript") > install_idx
+    assert cmd.index("typescript@5") > install_idx
 
 
 def test_install_npm_works_without_extras(tmp_path, monkeypatch):

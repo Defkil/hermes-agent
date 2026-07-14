@@ -456,6 +456,28 @@ def decompose_task(
     )
 
 
+def list_auto_decompose_ids(*, tenant: Optional[str] = None) -> list[str]:
+    """Return fresh triage tasks safe for unattended decomposition.
+
+    A task moved to triage by the block-loop breaker is explicitly waiting for
+    human direction. Feeding it straight back into the automatic decomposer
+    defeats the breaker and can start another copy of the same failed work.
+    Explicit ``decompose <id>`` remains available for a human decision.
+    """
+    with kb.connect_closing() as conn:
+        rows = kb.list_tasks(
+            conn,
+            status="triage",
+            tenant=tenant,
+            limit=1000,
+        )
+    return [
+        row.id
+        for row in rows
+        if row.block_recurrences < kb.BLOCK_RECURRENCE_LIMIT
+    ]
+
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
     with kb.connect_closing() as conn:

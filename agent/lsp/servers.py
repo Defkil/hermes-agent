@@ -191,9 +191,15 @@ def _file_ext_or_basename(path: str) -> str:
 def _which(*names: str) -> Optional[str]:
     """Return the full path of the first command found on PATH."""
     for n in names:
-        path = shutil.which(n)
-        if path:
-            return path
+        candidates = (n,)
+        if os.name == "nt" and not os.path.splitext(os.path.basename(n))[1]:
+            # npm installs both a POSIX shim and native Windows wrappers.
+            # CreateProcess cannot execute the extensionless shim directly.
+            candidates = (f"{n}.cmd", f"{n}.exe", f"{n}.bat")
+        for candidate in candidates:
+            path = shutil.which(candidate)
+            if path:
+                return path
     return None
 
 
@@ -356,7 +362,9 @@ def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     global _BASH_SHELLCHECK_WARNED
     if not _BASH_SHELLCHECK_WARNED and _which("shellcheck") is None:
         _BASH_SHELLCHECK_WARNED = True
-        logger.warning(
+        # ``hermes lsp status`` already surfaces this actionable optional
+        # backend gap. Keep runtime logs quiet when opening every shell file.
+        logger.info(
             "bash-language-server: shellcheck not found on PATH — "
             "diagnostics will be empty until shellcheck is installed "
             "(apt: shellcheck, brew: shellcheck, scoop: shellcheck)."

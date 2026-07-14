@@ -133,6 +133,26 @@ class TestCheckFnTransientFailureSuppression:
         monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
         assert reg._check_fn_cached(never) is False
 
+    def test_expected_unavailability_does_not_emit_warning(self, caplog):
+        import tools.registry as reg
+
+        with caplog.at_level("WARNING"):
+            assert reg._check_fn_cached(lambda: False) is False
+
+        assert not caplog.records
+
+    def test_probe_exception_remains_visible(self, caplog):
+        import tools.registry as reg
+
+        def broken():
+            raise RuntimeError("probe broke")
+
+        with caplog.at_level("WARNING"):
+            assert reg._check_fn_cached(broken) is False
+
+        assert len(caplog.records) == 1
+        assert "raised" in caplog.records[0].message
+
     def test_grace_expiry_lets_real_outage_through(self, monkeypatch):
         import tools.registry as reg
 
