@@ -958,6 +958,11 @@ class ShellFileOperations(FileOperations):
         
         return path
     
+    @staticmethod
+    def _single_quote_shell_arg(arg: str) -> str:
+        """Single-quote one already-normalized shell argument."""
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
 
@@ -971,9 +976,23 @@ class ShellFileOperations(FileOperations):
         """
         from tools.environments.local import _bash_safe_path
 
-        arg = _bash_safe_path(arg)
-        # Use single quotes and escape any single quotes in the string
-        return "'" + arg.replace("'", "'\"'\"'") + "'"
+        return self._single_quote_shell_arg(_bash_safe_path(arg))
+
+    def _escape_native_tool_path(self, path: str) -> str:
+        """Quote a filesystem path for a native executable invoked by Git Bash.
+
+        The local Windows environment intentionally exports
+        ``MSYS2_ARG_CONV_EXCL=*``. POSIX tools such as ``sed`` need ``/c/...``
+        paths, but native ``rg.exe`` receives that spelling verbatim and cannot
+        open it. Convert MSYS drive paths back to a forward-slash Windows path
+        for ripgrep while leaving POSIX/container hosts unchanged.
+        """
+        from tools.environments import local as local_env
+
+        normalized = path
+        if local_env._IS_WINDOWS:
+            normalized = local_env._msys_to_windows_path(path).replace("\\", "/")
+        return self._single_quote_shell_arg(normalized)
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
@@ -2218,7 +2237,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_native_tool_path(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2229,7 +2248,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_native_tool_path(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2283,9 +2302,11 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
+        # Add pattern and path. Ripgrep is a native executable on Windows;
+        # with MSYS argument conversion disabled it needs a native drive path,
+        # while the pattern remains an ordinary shell argument.
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_tool_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
